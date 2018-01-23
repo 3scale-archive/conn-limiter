@@ -1,0 +1,18 @@
+version: 2
+jobs:
+  build:
+    machine: true
+    environment:
+      S2I_VERSION: "1.1.7-226afa1"
+    steps:
+      - checkout
+      - run: .circleci/install-s2i.sh ~/bin
+      - run: make build
+      - run: make build
+      - run: make test
+      - run:
+          name: install ngrok
+          command: |
+            wget -c https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip -O /tmp/ngrok.zip
+            unzip /tmp/ngrok.zip -d ~/bin/
+      - run: make integration-test
