@@ -11,6 +11,26 @@ local _M = {
 
 }
 
+local ngx_semaphore = require "ngx.semaphore"
+
+local resty_redis = require('resty.redis')
+
+local assert = assert
+
+
+local function redis_shdict(host, port)
+  local redis = assert(resty_redis:new())
+
+  if redis:connect(host or '127.0.0.1', port or 6379) then
+    return {
+      incr = function(_, key, increment, _)
+        return redis:incrby(key, increment)
+      end,
+      close = function() return redis:set_keepalive() end
+    }
+  end
+end
+
 
 function _M:access()
   -- limit the requests under 200 concurrent requests (normally just
@@ -27,6 +47,8 @@ function _M:access()
       "failed to instantiate a resty.limit.conn object: ", err)
     return ngx.exit(500)
   end
+
+  lim.dict = redis_shdict()
 
   -- the following call must be per-request.
   -- here we use the remote (IP) address as the limiting key
@@ -48,7 +70,10 @@ function _M:access()
     ctx.limit_conn_key = key
     ctx.limit_conn_delay = delay
     ctx.metric_labels = labels
+    ctx.redis = redis
   end
+
+  lim.dict:close()
 
   -- the 2nd return value holds the current concurrency level
   -- for the specified key.
@@ -79,28 +104,53 @@ function _M:metrics()
   return prometheus:collect()
 end
 
-function _M:log()
-  local ctx = ngx.ctx
+local function checkin(_, ctx, time, semaphore)
   local lim = ctx.limit_conn
-  if lim then
-    -- if you are using an upstream module in the content phase,
-    -- then you probably want to use $upstream_response_time
-    -- instead of ($request_time - ctx.limit_conn_delay) below.
-    local latency = tonumber(ngx.var.request_time) - ctx.limit_conn_delay
-    local key = ctx.limit_conn_key
-    assert(key)
-    local conn, err = lim:leaving(key, latency)
 
-    if not conn then
-      ngx.log(ngx.ERR,
-        "failed to record the connection leaving ",
-        "request: ", err)
-      return
-    end
+  lim.dict = redis_shdict()
+  -- if you are using an upstream module in the content phase,
+  -- then you probably want to use $upstream_response_time
+  -- instead of ($request_time - ctx.limit_conn_delay) below.
+  local latency = tonumber(time) - ctx.limit_conn_delay
+  local key = ctx.limit_conn_key
+  assert(key)
+  local conn, err = lim:leaving(key, latency)
 
-    opened_connections:set(conn,  ctx.metric_labels)
+  if not conn then
+    ngx.log(ngx.ERR,
+      "failed to record the connection leaving ",
+      "request: ", err)
+    return
   end
 
+  opened_connections:set(conn,  ctx.metric_labels)
+
+  lim.dict:close()
+
+  if semaphore then
+    semaphore:post(1)
+  end
+end
+
+function _M:post_action()
+  local ctx = ngx.ctx
+  local lim = ctx.limit_conn
+
+  if lim then
+    -- checkin(false, ctx, ngx.var.request_time)
+  end
+end
+
+function _M:log()
+  local lim = ngx.ctx.limit_conn
+
+  if lim then
+    local semaphore = ngx_semaphore.new()
+
+    ngx.timer.at(0, checkin, ngx.ctx, ngx.var.request_time, semaphore)
+
+    semaphore:wait(10)
+  end
 
   metric_requests:inc(1, {ngx.var.status})
 end
